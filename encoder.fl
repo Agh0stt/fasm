@@ -1,0 +1,444 @@
+import "std"
+import "vec"
+import "parser"
+import "bytebuf"
+import "regs"
+import "symtab"
+
+# ModRM byte for register-direct addressing: mod=11, reg field, rm field
+func modrm_reg(reg_field: int, rm_field: int) -> int {
+    return 0xC0 | (reg_field << 3) | rm_field
+}
+
+# Size (bytes) of just the ModRM(+disp) portion of a memory operand —
+# NOT including the leading opcode byte(s). Must stay in sync with
+# mem_encode below.
+#   label (no base)      -> 5  (ModRM + disp32)
+#   %ebp with disp==0     -> 2  (ModRM + disp8=0, since mod=00/rm=101
+#                                 is reserved for the label-only form)
+#   any other reg, disp=0 -> 1  (ModRM only)
+#   any other reg, disp!=0-> 5  (ModRM + disp32, always — no disp8
+#                                 optimization in v1)
+# %esp as a base is unsupported (needs a SIB byte) — dies clearly.
+func mem_size(base: str, disp: int, label: str) -> int {
+    if (_flr_str_len(label) > 0) { return 5 }
+    if (_flr_str_eq(base, "ebp") and disp == 0) { return 2 }
+    if (_flr_str_eq(base, "esp")) {
+        print("fasm: %esp as a memory base needs a SIB byte, not supported yet")
+        _flr_exit(1)
+    }
+    if (disp == 0) { return 1 }
+    return 5
+}
+
+func mem_encode(buf: Vec, reg_field: int, base: str, disp: int, label: str, syms: Vec, line: int) -> void {
+    if (_flr_str_len(label) > 0) {
+        emit8(buf, (reg_field << 3) | 5)
+        addr: int = sym_lookup(syms, label, line)
+        emit32(buf, addr)
+        return
+    }
+    if (_flr_str_eq(base, "ebp") and disp == 0) {
+        emit8(buf, 0x40 | (reg_field << 3) | 5)
+        emit8(buf, 0)
+        return
+    }
+    bn: int = reg_num(base)
+    if (disp == 0) {
+        emit8(buf, (reg_field << 3) | bn)
+        return
+    }
+    emit8(buf, 0x80 | (reg_field << 3) | bn)
+    emit32(buf, disp)
+}
+
+# condition codes for the 0F 8x rel32 jcc family; -1 = not a jcc mnemonic
+func jcc_code(m: str) -> int {
+    if (_flr_str_eq(m, "je") or _flr_str_eq(m, "jz")) { return 0x84 }
+    if (_flr_str_eq(m, "jne") or _flr_str_eq(m, "jnz")) { return 0x85 }
+    if (_flr_str_eq(m, "jl")) { return 0x8c }
+    if (_flr_str_eq(m, "jle")) { return 0x8e }
+    if (_flr_str_eq(m, "jg")) { return 0x8f }
+    if (_flr_str_eq(m, "jge")) { return 0x8d }
+    if (_flr_str_eq(m, "jb") or _flr_str_eq(m, "jc")) { return 0x82 }
+    if (_flr_str_eq(m, "jbe")) { return 0x86 }
+    if (_flr_str_eq(m, "ja")) { return 0x87 }
+    if (_flr_str_eq(m, "jae") or _flr_str_eq(m, "jnc")) { return 0x83 }
+    return -1
+}
+
+# Size (in bytes) an instruction will encode to. Must stay in exact sync
+# with encode_item below — this is what makes two-pass label resolution
+# possible: label/jump operands encode to a fixed size regardless of the
+# actual resolved address, so instruction sizes don't depend on whether
+# the symbol table is filled in yet.
+func instr_size(it: Item) -> int {
+    if (it.kind != IT_INSTR) { return 0 }
+    m: str = it.mnemonic
+
+    if (_flr_str_eq(m, "mov")) {
+        if (it.op1_kind == OP_IMM and it.op2_kind == OP_REG) { return 5 }
+        elif (it.op1_kind == OP_LABEL and it.op2_kind == OP_REG) { return 5 }
+        elif (it.op1_kind == OP_REG and it.op2_kind == OP_REG) { return 2 }
+        elif (it.op1_kind == OP_MEM and it.op2_kind == OP_REG) {
+            return 1 + mem_size(it.op1_mem_base, it.op1_mem_disp, it.op1_mem_label)
+        } elif (it.op1_kind == OP_REG and it.op2_kind == OP_MEM) {
+            return 1 + mem_size(it.op2_mem_base, it.op2_mem_disp, it.op2_mem_label)
+        } elif (it.op1_kind == OP_IMM and it.op2_kind == OP_MEM) {
+            return 1 + mem_size(it.op2_mem_base, it.op2_mem_disp, it.op2_mem_label) + 4
+        } else {
+            print("fasm: unsupported mov operand combination at line")
+            print(it.line)
+            _flr_exit(1)
+        }
+    } elif (_flr_str_eq(m, "lea")) {
+        return 1 + mem_size(it.op1_mem_base, it.op1_mem_disp, it.op1_mem_label)
+    } elif (_flr_str_eq(m, "xor")) {
+        return 2
+    } elif (_flr_str_eq(m, "add") or _flr_str_eq(m, "sub") or _flr_str_eq(m, "cmp")) {
+        if (it.op1_kind == OP_REG and it.op2_kind == OP_REG) { return 2 }
+        elif (it.op1_kind == OP_IMM and it.op2_kind == OP_REG) { return 6 }
+        else {
+            print("fasm: unsupported operand combination at line")
+            print(it.line)
+            _flr_exit(1)
+        }
+    } elif (_flr_str_eq(m, "push")) {
+        if (it.op1_kind == OP_REG) { return 1 }
+        elif (it.op1_kind == OP_IMM) { return 5 }
+        else {
+            print("fasm: unsupported push operand at line")
+            print(it.line)
+            _flr_exit(1)
+        }
+    } elif (_flr_str_eq(m, "pop")) {
+        return 1
+    } elif (_flr_str_eq(m, "jmp") or _flr_str_eq(m, "call")) {
+        return 5
+    } elif (jcc_code(m) >= 0) {
+        return 6
+    } elif (_flr_str_eq(m, "int")) {
+        return 2
+    } elif (_flr_str_eq(m, "ret")) {
+        return 1
+    } elif (_flr_str_eq(m, "nop")) {
+        return 1
+    } elif (_flr_str_eq(m, "cdq")) {
+        return 1
+    } elif (_flr_str_eq(m, "inc") or _flr_str_eq(m, "dec")) {
+        # INC/DEC r32: 0x40+r / 0x48+r  (1 byte)
+        return 1
+    } elif (_flr_str_eq(m, "neg") or _flr_str_eq(m, "not")) {
+        # NEG r32: F7 /3   NOT r32: F7 /2  (2 bytes)
+        return 2
+    } elif (_flr_str_eq(m, "and") or _flr_str_eq(m, "or")) {
+        # and/or r,r -> 2 bytes;  and/or imm,r -> 6 bytes
+        if (it.op1_kind == OP_REG and it.op2_kind == OP_REG) { return 2 }
+        elif (it.op1_kind == OP_IMM and it.op2_kind == OP_REG) { return 6 }
+        else {
+            print("fasm: unsupported and/or operand combination at line")
+            print(it.line)
+            _flr_exit(1)
+        }
+    } elif (_flr_str_eq(m, "shl") or _flr_str_eq(m, "shr")) {
+        # shl/shr $imm8,%reg  or  shl/shr %cl,%reg
+        # C1 /4 ib  /  C1 /5 ib   or   D3 /4 / D3 /5
+        if (it.op1_kind == OP_IMM) { return 3 }
+        else { return 2 }
+    } elif (_flr_str_eq(m, "imul")) {
+        # imul r32: F7 /5  (2 bytes — one-operand form; eax implicit)
+        return 2
+    } elif (_flr_str_eq(m, "idiv")) {
+        # idiv r32: F7 /7  (2 bytes)
+        return 2
+    } else {
+        print("fasm: unknown mnemonic at line")
+        print(it.line)
+        print(m)
+        _flr_exit(1)
+    }
+    return 0
+}
+
+func encode_item(buf: Vec, it: Item, syms: Vec, addr: int) -> void {
+    if (it.kind != IT_INSTR) { return }
+    m: str = it.mnemonic
+
+    if (_flr_str_eq(m, "mov")) {
+        if (it.op1_kind == OP_IMM and it.op2_kind == OP_REG) {
+            emit8(buf, 0xb8 + reg_num(it.op2_reg))
+            emit32(buf, it.op1_imm)
+        } elif (it.op1_kind == OP_LABEL and it.op2_kind == OP_REG) {
+            a: int = sym_lookup(syms, it.op1_label, it.line)
+            emit8(buf, 0xb8 + reg_num(it.op2_reg))
+            emit32(buf, a)
+        } elif (it.op1_kind == OP_REG and it.op2_kind == OP_REG) {
+            emit8(buf, 0x89)
+            emit8(buf, modrm_reg(reg_num(it.op1_reg), reg_num(it.op2_reg)))
+        } elif (it.op1_kind == OP_MEM and it.op2_kind == OP_REG) {
+            emit8(buf, 0x8b)
+            mem_encode(buf, reg_num(it.op2_reg), it.op1_mem_base, it.op1_mem_disp, it.op1_mem_label, syms, it.line)
+        } elif (it.op1_kind == OP_REG and it.op2_kind == OP_MEM) {
+            emit8(buf, 0x89)
+            mem_encode(buf, reg_num(it.op1_reg), it.op2_mem_base, it.op2_mem_disp, it.op2_mem_label, syms, it.line)
+        } elif (it.op1_kind == OP_IMM and it.op2_kind == OP_MEM) {
+            emit8(buf, 0xc7)
+            mem_encode(buf, 0, it.op2_mem_base, it.op2_mem_disp, it.op2_mem_label, syms, it.line)
+            emit32(buf, it.op1_imm)
+        } else {
+            print("fasm: unsupported mov operand combination at line")
+            print(it.line)
+            _flr_exit(1)
+        }
+    } elif (_flr_str_eq(m, "lea")) {
+        emit8(buf, 0x8d)
+        mem_encode(buf, reg_num(it.op2_reg), it.op1_mem_base, it.op1_mem_disp, it.op1_mem_label, syms, it.line)
+    } elif (_flr_str_eq(m, "xor")) {
+        emit8(buf, 0x31)
+        emit8(buf, modrm_reg(reg_num(it.op1_reg), reg_num(it.op2_reg)))
+    } elif (_flr_str_eq(m, "add") or _flr_str_eq(m, "sub") or _flr_str_eq(m, "cmp")) {
+        if (it.op1_kind == OP_REG and it.op2_kind == OP_REG) {
+            opc: int = 0x01
+            if (_flr_str_eq(m, "sub")) { opc = 0x29 }
+            elif (_flr_str_eq(m, "cmp")) { opc = 0x39 }
+            emit8(buf, opc)
+            emit8(buf, modrm_reg(reg_num(it.op1_reg), reg_num(it.op2_reg)))
+        } else {
+            ext: int = 0
+            if (_flr_str_eq(m, "sub")) { ext = 5 }
+            elif (_flr_str_eq(m, "cmp")) { ext = 7 }
+            emit8(buf, 0x81)
+            emit8(buf, modrm_reg(ext, reg_num(it.op2_reg)))
+            emit32(buf, it.op1_imm)
+        }
+    } elif (_flr_str_eq(m, "push")) {
+        if (it.op1_kind == OP_REG) {
+            emit8(buf, 0x50 + reg_num(it.op1_reg))
+        } else {
+            emit8(buf, 0x68)
+            emit32(buf, it.op1_imm)
+        }
+    } elif (_flr_str_eq(m, "pop")) {
+        emit8(buf, 0x58 + reg_num(it.op1_reg))
+    } elif (_flr_str_eq(m, "jmp")) {
+        target: int = sym_lookup(syms, it.op1_label, it.line)
+        emit8(buf, 0xe9)
+        emit32(buf, target - (addr + 5))
+    } elif (_flr_str_eq(m, "call")) {
+        target: int = sym_lookup(syms, it.op1_label, it.line)
+        emit8(buf, 0xe8)
+        emit32(buf, target - (addr + 5))
+    } elif (jcc_code(m) >= 0) {
+        target: int = sym_lookup(syms, it.op1_label, it.line)
+        emit8(buf, 0x0f)
+        emit8(buf, jcc_code(m))
+        emit32(buf, target - (addr + 6))
+    } elif (_flr_str_eq(m, "int")) {
+        emit8(buf, 0xcd)
+        emit8(buf, it.op1_imm & 0xff)
+    } elif (_flr_str_eq(m, "ret")) {
+        emit8(buf, 0xc3)
+    } elif (_flr_str_eq(m, "nop")) {
+        emit8(buf, 0x90)
+    } elif (_flr_str_eq(m, "cdq")) {
+        # CDQ — sign-extend EAX into EDX:EAX  (needed before IDIV)
+        emit8(buf, 0x99)
+    } elif (_flr_str_eq(m, "inc")) {
+        # INC r32: opcode 0x40+r
+        emit8(buf, 0x40 + reg_num(it.op1_reg))
+    } elif (_flr_str_eq(m, "dec")) {
+        # DEC r32: opcode 0x48+r
+        emit8(buf, 0x48 + reg_num(it.op1_reg))
+    } elif (_flr_str_eq(m, "neg")) {
+        # NEG r32: F7 /3
+        emit8(buf, 0xf7)
+        emit8(buf, modrm_reg(3, reg_num(it.op1_reg)))
+    } elif (_flr_str_eq(m, "not")) {
+        # NOT r32: F7 /2
+        emit8(buf, 0xf7)
+        emit8(buf, modrm_reg(2, reg_num(it.op1_reg)))
+    } elif (_flr_str_eq(m, "and")) {
+        if (it.op1_kind == OP_REG and it.op2_kind == OP_REG) {
+            # AND r/m32, r32: 21 /r
+            emit8(buf, 0x21)
+            emit8(buf, modrm_reg(reg_num(it.op1_reg), reg_num(it.op2_reg)))
+        } else {
+            # AND imm32, r/m32: 81 /4 id
+            emit8(buf, 0x81)
+            emit8(buf, modrm_reg(4, reg_num(it.op2_reg)))
+            emit32(buf, it.op1_imm)
+        }
+    } elif (_flr_str_eq(m, "or")) {
+        if (it.op1_kind == OP_REG and it.op2_kind == OP_REG) {
+            # OR r/m32, r32: 09 /r
+            emit8(buf, 0x09)
+            emit8(buf, modrm_reg(reg_num(it.op1_reg), reg_num(it.op2_reg)))
+        } else {
+            # OR imm32, r/m32: 81 /1 id
+            emit8(buf, 0x81)
+            emit8(buf, modrm_reg(1, reg_num(it.op2_reg)))
+            emit32(buf, it.op1_imm)
+        }
+    } elif (_flr_str_eq(m, "shl")) {
+        if (it.op1_kind == OP_IMM) {
+            # SHL r/m32, imm8: C1 /4 ib
+            emit8(buf, 0xc1)
+            emit8(buf, modrm_reg(4, reg_num(it.op2_reg)))
+            emit8(buf, it.op1_imm & 0xff)
+        } else {
+            # SHL r/m32, CL: D3 /4
+            emit8(buf, 0xd3)
+            emit8(buf, modrm_reg(4, reg_num(it.op2_reg)))
+        }
+    } elif (_flr_str_eq(m, "shr")) {
+        if (it.op1_kind == OP_IMM) {
+            # SHR r/m32, imm8: C1 /5 ib
+            emit8(buf, 0xc1)
+            emit8(buf, modrm_reg(5, reg_num(it.op2_reg)))
+            emit8(buf, it.op1_imm & 0xff)
+        } else {
+            # SHR r/m32, CL: D3 /5
+            emit8(buf, 0xd3)
+            emit8(buf, modrm_reg(5, reg_num(it.op2_reg)))
+        }
+    } elif (_flr_str_eq(m, "imul")) {
+        # IMUL r/m32 (one-operand): F7 /5  — EDX:EAX = EAX * src
+        emit8(buf, 0xf7)
+        emit8(buf, modrm_reg(5, reg_num(it.op1_reg)))
+    } elif (_flr_str_eq(m, "idiv")) {
+        # IDIV r/m32 (one-operand): F7 /7  — EAX = EDX:EAX / src, EDX = rem
+        emit8(buf, 0xf7)
+        emit8(buf, modrm_reg(7, reg_num(it.op1_reg)))
+    } else {
+        print("fasm: unknown mnemonic at line")
+        print(it.line)
+        print(m)
+        _flr_exit(1)
+    }
+}
+
+# Full two-pass encode: buckets items by section, sizes the .text and
+# .data regions, resolves every label to an absolute address, then
+# emits real machine code + data bytes. Returns nothing directly —
+# results land in the out_* fields the caller passes in via [int]/Vec
+# out-params, since Falcon has no multi-return.
+func encode_all(items: Vec, text_base: int,
+                out_text: Vec, out_data: Vec,
+                out_bss_size: [int]) -> void {
+    text_items: Vec = vec_new(64)
+    data_items: Vec = vec_new(64)
+    bss_items: Vec = vec_new(16)
+
+    # 0 = text, 1 = data, 2 = bss
+    cur_section: int = 0
+    i: int = 0
+    while (i < items.len) {
+        it: Item = vec_get(items, i)
+        if (it.kind == IT_SECTION) {
+            if (_flr_str_eq(it.sval, "text")) { cur_section = 0 }
+            elif (_flr_str_eq(it.sval, "bss")) { cur_section = 2 }
+            else { cur_section = 1 }
+        } elif (cur_section == 0) { vec_push(text_items, it) }
+        elif (cur_section == 2) { vec_push(bss_items, it) }
+        else { vec_push(data_items, it) }
+        i += 1
+    }
+
+    # ── pass 1: compute sizes and label addresses ──
+    syms: Vec = symtab_new()
+
+    text_size: int = 0
+    i = 0
+    while (i < text_items.len) {
+        it: Item = vec_get(text_items, i)
+        if (_flr_str_len(it.label) > 0) {
+            sym_add(syms, it.label, text_base + text_size)
+        }
+        text_size += instr_size(it)
+        i += 1
+    }
+
+    data_base: int = text_base + text_size
+    data_size: int = 0
+    i = 0
+    while (i < data_items.len) {
+        it: Item = vec_get(data_items, i)
+        if (_flr_str_len(it.label) > 0) {
+            sym_add(syms, it.label, data_base + data_size)
+        }
+        if (it.kind == IT_DATA) {
+            j: int = 0
+            while (j < it.data.len) {
+                di: DataItem = vec_get(it.data, j)
+                if (di.is_str == 1) {
+                    data_size += _flr_str_len(di.sval)
+                } else {
+                    data_size += it.width
+                }
+                j += 1
+            }
+        }
+        i += 1
+    }
+
+    bss_base: int = data_base + data_size
+    bss_size: int = 0
+    i = 0
+    while (i < bss_items.len) {
+        it: Item = vec_get(bss_items, i)
+        if (_flr_str_len(it.label) > 0) {
+            sym_add(syms, it.label, bss_base + bss_size)
+        }
+        if (it.kind == IT_RES) {
+            bss_size += it.count * it.width
+        }
+        i += 1
+    }
+
+    # ── pass 2: real encode, labels now resolvable ──
+    # track a running address alongside the loop so jmp/call/jcc can
+    # compute rel32 offsets relative to the end of their own instruction
+    i = 0
+    running_addr: int = text_base
+    while (i < text_items.len) {
+        cur_it: Item = vec_get(text_items, i)
+        encode_item(out_text, cur_it, syms, running_addr)
+        running_addr += instr_size(cur_it)
+        i += 1
+    }
+
+    i = 0
+    while (i < data_items.len) {
+        it: Item = vec_get(data_items, i)
+        if (it.kind == IT_DATA) {
+            j: int = 0
+            while (j < it.data.len) {
+                di: DataItem = vec_get(it.data, j)
+                if (di.is_str == 1) {
+                    k: int = 0
+                    slen: int = _flr_str_len(di.sval)
+                    sptr: int = di.sval
+                    while (k < slen) {
+                        emit8(out_data, __peekb(sptr + k))
+                        k += 1
+                    }
+                } else {
+                    if (it.width == 1) { emit8(out_data, di.ival) }
+                    elif (it.width == 2) {
+                        emit8(out_data, di.ival & 0xff)
+                        emit8(out_data, (di.ival >> 8) & 0xff)
+                    } elif (it.width == 4) {
+                        emit32(out_data, di.ival)
+                    } else {
+                        emit32(out_data, di.ival & 0xffffffff)
+                        emit32(out_data, 0)
+                    }
+                }
+                j += 1
+            }
+        }
+        i += 1
+    }
+
+    out_bss_size[0] = bss_size
+}

@@ -1,0 +1,194 @@
+# lexer.fl — turns a raw source buffer into a Vec of Token pointers.
+# Cursor convention: a 1-element [int] array `pos` acts as a mutable
+# position reference threaded through helper functions (Falcon has no
+# in/out params or multiple return values).
+
+import "std"
+import "vec"
+import "ascii"
+import "strutil"
+
+TK_EOF: int = 0
+TK_IDENT: int = 1
+TK_REG: int = 2
+TK_IMM: int = 3
+TK_NUM: int = 4
+TK_STR: int = 5
+TK_COMMA: int = 6
+TK_COLON: int = 7
+TK_NEWLINE: int = 8
+TK_SECTION: int = 9
+TK_MINUS: int = 10
+TK_LPAREN: int = 11
+TK_RPAREN: int = 12
+
+struct Token {
+    kind: int
+    ival: int
+    sval: str
+    line: int
+}
+
+func mktok(kind: int, ival: int, sval: str, line: int) -> Token {
+    t: Token = _flr_alloc(16)
+    t.kind = kind
+    t.ival = ival
+    t.sval = sval
+    t.line = line
+    return t
+}
+
+func cur(buf: int, len: int, pos: [int]) -> int {
+    p: int = pos[0]
+    if (p >= len) { return -1 }
+    return __peekb(buf + p)
+}
+
+func peek_at(buf: int, len: int, pos: [int], off: int) -> int {
+    p: int = pos[0] + off
+    if (p >= len) { return -1 }
+    return __peekb(buf + p)
+}
+
+func adv(pos: [int]) -> void {
+    pos[0] += 1
+}
+
+# reads [0-9]+ or 0x[0-9a-fA-F]+ starting at pos, returns the value
+func lex_number(buf: int, len: int, pos: [int]) -> int {
+    c0: int = cur(buf, len, pos)
+    c1: int = peek_at(buf, len, pos, 1)
+    if (c0 == CH_0 and (c1 == CH_x or c1 == 88)) {
+        adv(pos)
+        adv(pos)
+        val: int = 0
+        while (is_hexdigit(cur(buf, len, pos))) {
+            c: int = cur(buf, len, pos)
+            digit: int = 0
+            if (is_digit(c)) {
+                digit = c - CH_0
+            } elif (c >= CH_a) {
+                digit = c - CH_a + 10
+            } else {
+                digit = c - CH_A + 10
+            }
+            val = val * 16 + digit
+            adv(pos)
+        }
+        return val
+    }
+    val: int = 0
+    while (is_digit(cur(buf, len, pos))) {
+        val = val * 10 + (cur(buf, len, pos) - CH_0)
+        adv(pos)
+    }
+    return val
+}
+
+func lex_ident(buf: int, len: int, pos: [int]) -> str {
+    start: int = pos[0]
+    while (is_alnum(cur(buf, len, pos))) { adv(pos) }
+    return substr(buf, start, pos[0] - start)
+}
+
+# reads a "..." string literal (pos sitting just past the opening quote),
+# handling \n \t \\ \" \0 escapes. Returns the unescaped string.
+func lex_string(buf: int, len: int, pos: [int]) -> str {
+    cap: int = 64
+    out: int = _flr_alloc(cap)
+    n: int = 0
+    while (cur(buf, len, pos) != CH_QUOTE and cur(buf, len, pos) != -1) {
+        c: int = cur(buf, len, pos)
+        if (c == CH_BACKSLASH) {
+            adv(pos)
+            e: int = cur(buf, len, pos)
+            if (e == 110) { c = CH_NL }        # \n
+            elif (e == 116) { c = CH_TAB }      # \t
+            elif (e == 48) { c = 0 }            # \0
+            elif (e == CH_QUOTE) { c = CH_QUOTE }
+            elif (e == CH_BACKSLASH) { c = CH_BACKSLASH }
+            else { c = e }
+        }
+        if (n >= cap) {
+            newcap: int = cap * 2
+            newout: int = _flr_alloc(newcap)
+            __memcpy(newout, out, n)
+            out = newout
+            cap = newcap
+        }
+        __pokeb(out + n, c)
+        n += 1
+        adv(pos)
+    }
+    adv(pos)   # skip closing quote
+    result: int = _flr_alloc(n + 1)
+    __memcpy(result, out, n)
+    __pokeb(result + n, 0)
+    return result
+}
+
+func lex(buf: int, len: int) -> Vec {
+    toks: Vec = vec_new(256)
+    pos_arr: [int] = [0]
+    line: int = 1
+
+    while (cur(buf, len, pos_arr) != -1) {
+        c: int = cur(buf, len, pos_arr)
+
+        if (c == CH_HASH) {
+            while (cur(buf, len, pos_arr) != CH_NL and cur(buf, len, pos_arr) != -1) {
+                adv(pos_arr)
+            }
+        } elif (c == CH_NL) {
+            vec_push(toks, mktok(TK_NEWLINE, 0, "", line))
+            adv(pos_arr)
+            line += 1
+        } elif (c == CH_SPACE or c == CH_TAB or c == CH_CR) {
+            adv(pos_arr)
+        } elif (c == CH_COMMA) {
+            vec_push(toks, mktok(TK_COMMA, 0, "", line))
+            adv(pos_arr)
+        } elif (c == CH_COLON) {
+            vec_push(toks, mktok(TK_COLON, 0, "", line))
+            adv(pos_arr)
+        } elif (c == CH_MINUS) {
+            vec_push(toks, mktok(TK_MINUS, 0, "", line))
+            adv(pos_arr)
+        } elif (c == CH_LPAREN) {
+            vec_push(toks, mktok(TK_LPAREN, 0, "", line))
+            adv(pos_arr)
+        } elif (c == CH_RPAREN) {
+            vec_push(toks, mktok(TK_RPAREN, 0, "", line))
+            adv(pos_arr)
+        } elif (c == CH_PERCENT) {
+            adv(pos_arr)
+            name: str = lex_ident(buf, len, pos_arr)
+            vec_push(toks, mktok(TK_REG, 0, name, line))
+        } elif (c == CH_DOLLAR) {
+            adv(pos_arr)
+            val: int = lex_number(buf, len, pos_arr)
+            vec_push(toks, mktok(TK_IMM, val, "", line))
+        } elif (c == CH_DOT) {
+            adv(pos_arr)
+            name: str = lex_ident(buf, len, pos_arr)
+            vec_push(toks, mktok(TK_SECTION, 0, name, line))
+        } elif (c == CH_QUOTE) {
+            adv(pos_arr)
+            s: str = lex_string(buf, len, pos_arr)
+            vec_push(toks, mktok(TK_STR, 0, s, line))
+        } elif (is_digit(c)) {
+            val: int = lex_number(buf, len, pos_arr)
+            vec_push(toks, mktok(TK_NUM, val, "", line))
+        } elif (is_alpha(c)) {
+            name: str = lex_ident(buf, len, pos_arr)
+            vec_push(toks, mktok(TK_IDENT, 0, name, line))
+        } else {
+            print("fasm: unexpected character at line")
+            print(line)
+            _flr_exit(1)
+        }
+    }
+
+    vec_push(toks, mktok(TK_EOF, 0, "", line))
+    return toks
+}

@@ -1,0 +1,35 @@
+import "std"
+import "vec"
+
+struct SymEntry {
+    name: str
+    addr: int
+}
+
+func symtab_new() -> Vec {
+    return vec_new(32)
+}
+
+func sym_add(t: Vec, name: str, addr: int) -> void {
+    e: SymEntry = _flr_alloc(8)
+    e.name = name
+    e.addr = addr
+    vec_push(t, e)
+}
+
+# returns the address, or dies with a clear error if undefined
+func sym_lookup(t: Vec, name: str, line: int) -> int {
+    i: int = 0
+    while (i < t.len) {
+        e: SymEntry = vec_get(t, i)
+        if (_flr_str_eq(e.name, name)) {
+            return e.addr
+        }
+        i += 1
+    }
+    print("fasm: undefined symbol at line")
+    print(line)
+    print(name)
+    _flr_exit(1)
+    return -1
+}

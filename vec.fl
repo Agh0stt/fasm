@@ -1,0 +1,47 @@
+# vec.fl — growable vector of ints (typically used to store pointers
+# to structs, since Falcon structs are heap pointers). Falcon's native
+# [T] array literal is fixed-size at creation, so anything that grows
+# (token lists, instruction lists, symbol tables) uses this instead.
+#
+# Layout: a Vec is a struct { data: int, len: int, cap: int }
+# `data` is a raw heap block of `cap` 4-byte int slots — NOT a native
+# Falcon array (no 8-byte header), accessed only via __peek/__poke so
+# we can grow it freely without disturbing the native [] operator's
+# assumptions elsewhere in the codebase.
+
+import "std"
+
+struct Vec {
+    data: int
+    len: int
+    cap: int
+}
+
+func vec_new(initial_cap: int) -> Vec {
+    v: Vec = _flr_alloc(12)
+    v.data = _flr_alloc(initial_cap * 4)
+    v.len = 0
+    v.cap = initial_cap
+    return v
+}
+
+func vec_get(v: Vec, i: int) -> int {
+    return __peek(v.data + i * 4)
+}
+
+func vec_set(v: Vec, i: int, val: int) -> void {
+    __poke(v.data + i * 4, val)
+}
+
+func vec_push(v: Vec, val: int) -> void {
+    if (v.len >= v.cap) {
+        newcap: int = v.cap * 2
+        if (newcap < 8) { newcap = 8 }
+        newdata: int = _flr_alloc(newcap * 4)
+        __memcpy(newdata, v.data, v.len * 4)
+        v.data = newdata
+        v.cap = newcap
+    }
+    __poke(v.data + v.len * 4, val)
+    v.len += 1
+}

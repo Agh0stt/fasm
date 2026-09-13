@@ -1,0 +1,29 @@
+import "std"
+import "vec"
+
+func bytebuf_new() -> Vec {
+    return vec_new(64)
+}
+
+func emit8(b: Vec, v: int) -> void {
+    vec_push(b, v & 0xff)
+}
+
+func emit32(b: Vec, v: int) -> void {
+    emit8(b, v & 0xff)
+    emit8(b, (v >> 8) & 0xff)
+    emit8(b, (v >> 16) & 0xff)
+    emit8(b, (v >> 24) & 0xff)
+}
+
+# copies the accumulated bytes into a raw (non-Vec) memory block, for
+# handing off to the ELF writer / final file output.
+func bytebuf_to_raw(b: Vec) -> int {
+    raw: int = _flr_alloc(b.len)
+    i: int = 0
+    while (i < b.len) {
+        __pokeb(raw + i, vec_get(b, i))
+        i += 1
+    }
+    return raw
+}

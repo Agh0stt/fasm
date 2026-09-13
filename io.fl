@@ -1,0 +1,66 @@
+# fasm I/O layer — raw Linux syscalls, x86-32 int 0x80 ABI.
+# No libc, no stdio: everything goes through __syscall directly.
+
+import "std"
+
+SYS_READ: int = 3
+SYS_WRITE: int = 4
+SYS_OPEN: int = 5
+SYS_CLOSE: int = 6
+
+O_RDONLY: int = 0
+O_WRONLY: int = 1
+O_CREAT: int = 0x40      # 0100 octal
+O_TRUNC: int = 0x200     # 01000 octal
+
+func fs_open_read(path: str) -> int {
+    return __syscall(SYS_OPEN, path, O_RDONLY, 0)
+}
+
+func fs_open_write(path: str) -> int {
+    return __syscall(SYS_OPEN, path, O_WRONLY | O_CREAT | O_TRUNC, 493)  # mode 0755
+}
+
+func fs_read(fd: int, buf: int, len: int) -> int {
+    return __syscall(SYS_READ, fd, buf, len)
+}
+
+func fs_write(fd: int, buf: int, len: int) -> int {
+    return __syscall(SYS_WRITE, fd, buf, len)
+}
+
+func fs_close(fd: int) -> void {
+    __syscall(SYS_CLOSE, fd, 0, 0)
+}
+
+# Reads an entire file into a heap buffer. Returns the buffer pointer;
+# writes the byte count into *out_len via a single-element array (no
+# real pointer-out-param support, so we (ab)use a 1-elem [int] array).
+func read_whole_file(path: str, out_len: [int]) -> int {
+    fd: int = fs_open_read(path)
+    if (fd < 0) {
+        print("fasm: cannot open input file")
+        _flr_exit(1)
+    }
+
+    cap: int = 65536
+    buf: int = _flr_alloc(cap)
+    total: int = 0
+
+    while (true) {
+        if (total + 4096 > cap) {
+            newcap: int = cap * 2
+            newbuf: int = _flr_alloc(newcap)
+            __memcpy(newbuf, buf, total)
+            buf = newbuf
+            cap = newcap
+        }
+        n: int = fs_read(fd, buf + total, 4096)
+        if (n <= 0) { break }
+        total += n
+    }
+
+    fs_close(fd)
+    out_len[0] = total
+    return buf
+}

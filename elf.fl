@@ -1,0 +1,71 @@
+import "std"
+
+ELF_BASE: int = 0x08048000
+ELF_EHDR_SIZE: int = 52
+ELF_PHDR_SIZE: int = 32
+
+func w8(buf: int, off: int, val: int) -> void {
+    __pokeb(buf + off, val)
+}
+
+func w16(buf: int, off: int, val: int) -> void {
+    w8(buf, off, val & 0xff)
+    w8(buf, off + 1, (val >> 8) & 0xff)
+}
+
+func w32(buf: int, off: int, val: int) -> void {
+    __poke(buf + off, val)
+}
+
+# Builds a minimal single-PT_LOAD ELF32 executable: [ehdr][phdr][code][data],
+# with `bss_len` bytes of zero-filled space appended beyond the file
+# (memsz > filesz, standard .bss trick — no bytes in the file itself).
+# out_len[0] receives the total file size. Returns the raw buffer pointer.
+func build_elf(code: int, code_len: int, data: int, data_len: int,
+               bss_len: int, out_len: [int]) -> int {
+    total: int = ELF_EHDR_SIZE + ELF_PHDR_SIZE + code_len + data_len
+    memsz: int = total + bss_len
+    buf: int = _flr_alloc(total)
+    entry: int = ELF_BASE + ELF_EHDR_SIZE + ELF_PHDR_SIZE
+
+    w8(buf, 0, 0x7f)
+    w8(buf, 1, 0x45)
+    w8(buf, 2, 0x4c)
+    w8(buf, 3, 0x46)
+    w8(buf, 4, 1)
+    w8(buf, 5, 1)
+    w8(buf, 6, 1)
+    w8(buf, 7, 0)
+    w8(buf, 8, 0)
+
+    w16(buf, 16, 2)
+    w16(buf, 18, 3)
+    w32(buf, 20, 1)
+    w32(buf, 24, entry)
+    w32(buf, 28, ELF_EHDR_SIZE)
+    w32(buf, 32, 0)
+    w32(buf, 36, 0)
+    w16(buf, 40, ELF_EHDR_SIZE)
+    w16(buf, 42, ELF_PHDR_SIZE)
+    w16(buf, 44, 1)
+    w16(buf, 46, 0)
+    w16(buf, 48, 0)
+    w16(buf, 50, 0)
+
+    w32(buf, 52, 1)
+    w32(buf, 56, 0)
+    w32(buf, 60, ELF_BASE)
+    w32(buf, 64, ELF_BASE)
+    w32(buf, 68, total)
+    w32(buf, 72, memsz)
+    w32(buf, 76, 7)
+    w32(buf, 80, 0x1000)
+
+    __memcpy(buf + 84, code, code_len)
+    if (data_len > 0) {
+        __memcpy(buf + 84 + code_len, data, data_len)
+    }
+
+    out_len[0] = total
+    return buf
+}

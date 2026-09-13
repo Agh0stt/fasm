@@ -1,0 +1,20 @@
+# hello world — fasm test program
+# uses Linux int 0x80 syscall: write(1, msg, 13)
+
+section text
+global _start
+
+_start:
+    mov $4, %eax          # sys_write
+    mov $1, %ebx          # fd = stdout
+    mov msg, %ecx         # load address of msg into ecx
+    mov $13, %edx         # length "hello world!\n" = 13
+    int $0x80
+
+    mov $1, %eax          # sys_exit
+    xor %ebx, %ebx        # code = 0
+    int $0x80
+
+section data
+msg:
+    db "hello world!\n"

@@ -1,0 +1,47 @@
+import "std"
+import "io"
+import "vec"
+import "lexer"
+import "parser"
+import "bytebuf"
+import "regs"
+import "encoder"
+import "elf"
+
+func main(argc: int, argv: int) -> void {
+    if (argc != 3) {
+        print("usage: fasm <input.fasm> <output>")
+        _flr_exit(1)
+    }
+
+    # argv is a raw C char** from the OS — use __peek(argv + i*4) to read each pointer
+    infile: str  = __peek(argv + 4)   # argv[1]
+    outfile: str = __peek(argv + 8)   # argv[2]
+
+    len_out: [int] = [0]
+    src: int = read_whole_file(infile, len_out)
+    srclen: int = len_out[0]
+
+    toks: Vec = lex(src, srclen)
+    items: Vec = parse(toks)
+
+    text_base: int = ELF_BASE + ELF_EHDR_SIZE + ELF_PHDR_SIZE
+    out_text: Vec = bytebuf_new()
+    out_data: Vec = bytebuf_new()
+    bss_len: [int] = [0]
+    encode_all(items, text_base, out_text, out_data, bss_len)
+
+    code_raw: int = bytebuf_to_raw(out_text)
+    data_raw: int = bytebuf_to_raw(out_data)
+
+    elf_len: [int] = [0]
+    elf_buf: int = build_elf(code_raw, out_text.len, data_raw, out_data.len, bss_len[0], elf_len)
+
+    out_fd: int = fs_open_write(outfile)
+    if (out_fd < 0) {
+        print("fasm: cannot open output file")
+        _flr_exit(1)
+    }
+    fs_write(out_fd, elf_buf, elf_len[0])
+    fs_close(out_fd)
+}

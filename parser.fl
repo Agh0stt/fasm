@@ -1,0 +1,310 @@
+# parser.fl — token stream -> flat list of Items (one per source line).
+# Falcon structs have no unions, so Item just carries every field any
+# line kind might need; unused fields are left at their zero default.
+
+import "std"
+import "vec"
+import "lexer"
+
+OP_NONE: int = 0
+OP_REG: int = 1
+OP_IMM: int = 2
+OP_LABEL: int = 3
+OP_MEM: int = 4
+
+IT_NONE: int = 0
+IT_INSTR: int = 1
+IT_SECTION: int = 2
+IT_GLOBAL: int = 3
+IT_DATA: int = 4
+IT_RES: int = 5
+
+struct DataItem {
+    is_str: int
+    sval: str
+    ival: int
+}
+
+struct Item {
+    label: str
+    kind: int
+    mnemonic: str
+    op1_kind: int
+    op1_reg: str
+    op1_imm: int
+    op1_label: str
+    op1_mem_base: str
+    op1_mem_disp: int
+    op1_mem_label: str
+    op2_kind: int
+    op2_reg: str
+    op2_imm: int
+    op2_label: str
+    op2_mem_base: str
+    op2_mem_disp: int
+    op2_mem_label: str
+    sval: str
+    width: int
+    data: Vec
+    count: int
+    line: int
+}
+
+func mkitem() -> Item {
+    it: Item = _flr_alloc(88)
+    it.label = ""
+    it.kind = IT_NONE
+    it.mnemonic = ""
+    it.op1_kind = OP_NONE
+    it.op1_reg = ""
+    it.op1_label = ""
+    it.op1_mem_base = ""
+    it.op1_mem_label = ""
+    it.op2_kind = OP_NONE
+    it.op2_reg = ""
+    it.op2_label = ""
+    it.op2_mem_base = ""
+    it.op2_mem_label = ""
+    it.sval = ""
+    it.width = 0
+    it.count = 0
+    it.line = 0
+    return it
+}
+
+func tpeek(toks: Vec, idx: [int]) -> Token {
+    return vec_get(toks, idx[0])
+}
+
+func tadv(idx: [int]) -> void {
+    idx[0] += 1
+}
+
+func width_of(name: str) -> int {
+    if (_flr_str_eq(name, "db") or _flr_str_eq(name, "resb")) { return 1 }
+    elif (_flr_str_eq(name, "dw") or _flr_str_eq(name, "resw")) { return 2 }
+    elif (_flr_str_eq(name, "dd") or _flr_str_eq(name, "resd")) { return 4 }
+    elif (_flr_str_eq(name, "dq") or _flr_str_eq(name, "resq")) { return 8 }
+    return 0
+}
+
+# parses one operand into it.op{slot}_* fields (slot is 1 or 2).
+# Handles registers, immediates, bare labels (= address, our dialect's
+# convention — see file header), and memory operands in parens:
+#   (%reg)        -> base=reg, disp=0
+#   N(%reg)/-N(%reg) -> base=reg, disp=N
+#   (label)       -> absolute, resolved via the symbol table
+func parse_operand(toks: Vec, idx: [int], it: Item, slot: int) -> void {
+    t: Token = tpeek(toks, idx)
+
+    # memory operand: starts with '(' or a bare numeric displacement
+    if (t.kind == TK_LPAREN or t.kind == TK_NUM or
+        (t.kind == TK_MINUS and peek2_is_num(toks, idx))) {
+        disp: int = 0
+        if (t.kind == TK_NUM) {
+            disp = t.ival
+            tadv(idx)
+        } elif (t.kind == TK_MINUS) {
+            tadv(idx)
+            nt: Token = tpeek(toks, idx)
+            disp = 0 - nt.ival
+            tadv(idx)
+        }
+        # if what follows isn't '(', this wasn't actually a memory operand
+        # (shouldn't happen given our dialect, but fail clearly if so)
+        if (tpeek(toks, idx).kind != TK_LPAREN) {
+            print("fasm: expected '(' after displacement at line")
+            print(t.line)
+            _flr_exit(1)
+        }
+        tadv(idx)   # consume '('
+        inner: Token = tpeek(toks, idx)
+        base: str = ""
+        lbl: str = ""
+        if (inner.kind == TK_REG) {
+            base = inner.sval
+            tadv(idx)
+        } elif (inner.kind == TK_IDENT) {
+            lbl = inner.sval
+            tadv(idx)
+        } else {
+            print("fasm: expected register or label inside '()' at line")
+            print(t.line)
+            _flr_exit(1)
+        }
+        if (tpeek(toks, idx).kind != TK_RPAREN) {
+            print("fasm: expected ')' at line")
+            print(t.line)
+            _flr_exit(1)
+        }
+        tadv(idx)   # consume ')'
+        if (slot == 1) {
+            it.op1_kind = OP_MEM
+            it.op1_mem_base = base
+            it.op1_mem_disp = disp
+            it.op1_mem_label = lbl
+        } else {
+            it.op2_kind = OP_MEM
+            it.op2_mem_base = base
+            it.op2_mem_disp = disp
+            it.op2_mem_label = lbl
+        }
+        return
+    }
+
+    if (t.kind == TK_REG) {
+        if (slot == 1) {
+            it.op1_kind = OP_REG
+            it.op1_reg = t.sval
+        } else {
+            it.op2_kind = OP_REG
+            it.op2_reg = t.sval
+        }
+        tadv(idx)
+    } elif (t.kind == TK_IMM) {
+        if (slot == 1) {
+            it.op1_kind = OP_IMM
+            it.op1_imm = t.ival
+        } else {
+            it.op2_kind = OP_IMM
+            it.op2_imm = t.ival
+        }
+        tadv(idx)
+    } elif (t.kind == TK_MINUS) {
+        tadv(idx)
+        t2: Token = tpeek(toks, idx)
+        if (slot == 1) {
+            it.op1_kind = OP_IMM
+            it.op1_imm = 0 - t2.ival
+        } else {
+            it.op2_kind = OP_IMM
+            it.op2_imm = 0 - t2.ival
+        }
+        tadv(idx)
+    } elif (t.kind == TK_IDENT) {
+        if (slot == 1) {
+            it.op1_kind = OP_LABEL
+            it.op1_label = t.sval
+        } else {
+            it.op2_kind = OP_LABEL
+            it.op2_label = t.sval
+        }
+        tadv(idx)
+    } else {
+        print("fasm: expected operand at line")
+        print(t.line)
+        _flr_exit(1)
+    }
+}
+
+# lookahead helper: is the token after the current one TK_NUM? (used to
+# disambiguate "-4(%eax)" memory displacement from a bare negative
+# immediate, both of which start with TK_MINUS)
+func peek2_is_num(toks: Vec, idx: [int]) -> bool {
+    nxt: Token = vec_get(toks, idx[0] + 1)
+    return nxt.kind == TK_NUM
+}
+
+func parse(toks: Vec) -> Vec {
+    items: Vec = vec_new(256)
+    idx: [int] = [0]
+
+    while (tpeek(toks, idx).kind != TK_EOF) {
+        # skip blank lines
+        while (tpeek(toks, idx).kind == TK_NEWLINE) { tadv(idx) }
+        if (tpeek(toks, idx).kind == TK_EOF) { break }
+
+        it: Item = mkitem()
+        it.line = tpeek(toks, idx).line
+
+        # optional leading label
+        if (tpeek(toks, idx).kind == TK_IDENT) {
+            save: int = idx[0]
+            name: str = tpeek(toks, idx).sval
+            tadv(idx)
+            if (tpeek(toks, idx).kind == TK_COLON) {
+                tadv(idx)
+                it.label = name
+            } else {
+                idx[0] = save
+            }
+        }
+
+        t: Token = tpeek(toks, idx)
+
+        if (t.kind == TK_NEWLINE or t.kind == TK_EOF) {
+            # label-only line
+            it.kind = IT_NONE
+        } elif (t.kind == TK_IDENT and _flr_str_eq(t.sval, "section")) {
+            tadv(idx)
+            sec: Token = tpeek(toks, idx)
+            it.kind = IT_SECTION
+            it.sval = sec.sval
+            tadv(idx)
+        } elif (t.kind == TK_IDENT and _flr_str_eq(t.sval, "global")) {
+            tadv(idx)
+            sym: Token = tpeek(toks, idx)
+            it.kind = IT_GLOBAL
+            it.sval = sym.sval
+            tadv(idx)
+        } elif (t.kind == TK_IDENT and width_of(t.sval) > 0 and (_flr_str_eq(t.sval, "db") or _flr_str_eq(t.sval, "dw") or _flr_str_eq(t.sval, "dd") or _flr_str_eq(t.sval, "dq"))) {
+            it.kind = IT_DATA
+            it.width = width_of(t.sval)
+            tadv(idx)
+            it.data = vec_new(4)
+            loop_more: bool = true
+            while (loop_more) {
+                dt: Token = tpeek(toks, idx)
+                di: DataItem = _flr_alloc(12)
+                if (dt.kind == TK_STR) {
+                    di.is_str = 1
+                    di.sval = dt.sval
+                    di.ival = 0
+                    tadv(idx)
+                } elif (dt.kind == TK_MINUS) {
+                    tadv(idx)
+                    dt2: Token = tpeek(toks, idx)
+                    di.is_str = 0
+                    di.ival = 0 - dt2.ival
+                    tadv(idx)
+                } else {
+                    di.is_str = 0
+                    di.ival = dt.ival
+                    tadv(idx)
+                }
+                vec_push(it.data, di)
+                if (tpeek(toks, idx).kind == TK_COMMA) {
+                    tadv(idx)
+                } else {
+                    loop_more = false
+                }
+            }
+        } elif (t.kind == TK_IDENT and (_flr_str_eq(t.sval, "resb") or _flr_str_eq(t.sval, "resw") or _flr_str_eq(t.sval, "resd") or _flr_str_eq(t.sval, "resq"))) {
+            it.kind = IT_RES
+            it.width = width_of(t.sval)
+            tadv(idx)
+            cnt: Token = tpeek(toks, idx)
+            it.count = cnt.ival
+            tadv(idx)
+        } else {
+            it.kind = IT_INSTR
+            it.mnemonic = t.sval
+            tadv(idx)
+            nt: Token = tpeek(toks, idx)
+            if (nt.kind != TK_NEWLINE and nt.kind != TK_EOF) {
+                parse_operand(toks, idx, it, 1)
+                if (tpeek(toks, idx).kind == TK_COMMA) {
+                    tadv(idx)
+                    parse_operand(toks, idx, it, 2)
+                }
+            }
+        }
+
+        vec_push(items, it)
+
+        # end of line
+        if (tpeek(toks, idx).kind == TK_NEWLINE) { tadv(idx) }
+    }
+
+    return items
+}

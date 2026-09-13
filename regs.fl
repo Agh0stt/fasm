@@ -1,0 +1,16 @@
+import "std"
+
+func reg_num(name: str) -> int {
+    if (_flr_str_eq(name, "eax")) { return 0 }
+    elif (_flr_str_eq(name, "ecx")) { return 1 }
+    elif (_flr_str_eq(name, "edx")) { return 2 }
+    elif (_flr_str_eq(name, "ebx")) { return 3 }
+    elif (_flr_str_eq(name, "esp")) { return 4 }
+    elif (_flr_str_eq(name, "ebp")) { return 5 }
+    elif (_flr_str_eq(name, "esi")) { return 6 }
+    elif (_flr_str_eq(name, "edi")) { return 7 }
+    print("fasm: unknown register")
+    print(name)
+    _flr_exit(1)
+    return -1
+}

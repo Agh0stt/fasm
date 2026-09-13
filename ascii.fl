@@ -1,0 +1,41 @@
+# ascii.fl — named byte constants, since Falcon has no char literals.
+
+CH_TAB: int = 9
+CH_NL: int = 10
+CH_CR: int = 13
+CH_SPACE: int = 32
+CH_HASH: int = 35
+CH_DOLLAR: int = 36
+CH_PERCENT: int = 37
+CH_QUOTE: int = 34
+CH_COMMA: int = 44
+CH_MINUS: int = 45
+CH_DOT: int = 46
+CH_COLON: int = 58
+CH_LPAREN: int = 40
+CH_RPAREN: int = 41
+CH_0: int = 48
+CH_9: int = 57
+CH_A: int = 65
+CH_Z: int = 90
+CH_a: int = 97
+CH_x: int = 120
+CH_z: int = 122
+CH_UNDERSCORE: int = 95
+CH_BACKSLASH: int = 92
+
+func is_digit(c: int) -> bool {
+    return c >= CH_0 and c <= CH_9
+}
+
+func is_alpha(c: int) -> bool {
+    return (c >= CH_a and c <= CH_z) or (c >= CH_A and c <= CH_Z) or c == CH_UNDERSCORE
+}
+
+func is_alnum(c: int) -> bool {
+    return is_alpha(c) or is_digit(c)
+}
+
+func is_hexdigit(c: int) -> bool {
+    return is_digit(c) or (c >= 97 and c <= 102) or (c >= 65 and c <= 70)
+}

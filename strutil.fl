@@ -1,0 +1,8 @@
+import "std"
+
+func substr(buf: int, start: int, n: int) -> str {
+    p: int = _flr_alloc(n + 1)
+    __memcpy(p, buf + start, n)
+    __pokeb(p + n, 0)
+    return p
+}

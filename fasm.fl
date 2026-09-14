@@ -1,6 +1,7 @@
 import "std"
 import "io"
 import "vec"
+import "preproc"
 import "lexer"
 import "parser"
 import "bytebuf"
@@ -14,13 +15,16 @@ func main(argc: int, argv: int) -> void {
         _flr_exit(1)
     }
 
-    # argv is a raw C char** from the OS — use __peek(argv + i*4) to read each pointer
-    infile: str  = __peek(argv + 4)   # argv[1]
-    outfile: str = __peek(argv + 8)   # argv[2]
+    infile: str  = __peek(argv + 4)
+    outfile: str = __peek(argv + 8)
 
     len_out: [int] = [0]
-    src: int = read_whole_file(infile, len_out)
-    srclen: int = len_out[0]
+    raw: int = read_whole_file(infile, len_out)
+    rawlen: int = len_out[0]
+
+    pp_len: [int] = [0]
+    src: int = preprocess(raw, rawlen, infile, pp_len)
+    srclen: int = pp_len[0]
 
     toks: Vec = lex(src, srclen)
     items: Vec = parse(toks)

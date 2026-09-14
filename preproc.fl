@@ -1,0 +1,545 @@
+# preproc.fl — source-level preprocessor for fasm.
+#
+# Directives:
+#   %define NAME value       — simple token substitution (chains resolved)
+#   %undef  NAME             — remove a define
+#   %macro  NAME(p1,p2,...)  — parameterised macro; \param in body
+#   %endmacro
+#   %include "file"          — splice another file (absolute or relative path)
+
+import "std"
+import "vec"
+import "io"
+import "ascii"
+import "strutil"
+
+# ── output / string helpers ───────────────────────────────────────────
+
+func pp_emit_buf(out: Vec, src: int, n: int) -> void {
+    i: int = 0
+    while (i < n) { vec_push(out, __peekb(src + i))
+    i += 1 }
+}
+
+func pp_emit_str(out: Vec, s: int) -> void {
+    i: int = 0
+    while (__peekb(s + i) != 0) { vec_push(out, __peekb(s + i))
+    i += 1 }
+}
+
+func pp_emit_ch(out: Vec, c: int) -> void { vec_push(out, c & 0xff) }
+
+func pp_buf_to_str(buf: int, start: int, len: int) -> int {
+    p: int = _flr_alloc(len + 1)
+    __memcpy(p, buf + start, len)
+    __pokeb(p + len, 0)
+    return p
+}
+
+func pp_streq(a: int, b: int) -> int {
+    i: int = 0
+    while (__peekb(a + i) != 0 and __peekb(b + i) != 0) {
+        if (__peekb(a + i) != __peekb(b + i)) { return 0 }
+        i += 1
+    }
+    if (__peekb(a + i) == 0 and __peekb(b + i) == 0) { return 1 }
+    return 0
+}
+
+func pp_strlen(s: int) -> int {
+    n: int = 0
+    while (__peekb(s + n) != 0) { n += 1 }
+    return n
+}
+
+func pp_is_word(c: int) -> int {
+    if (c >= CH_a and c <= CH_z) { return 1 }
+    if (c >= CH_A and c <= CH_Z) { return 1 }
+    if (c >= CH_0 and c <= CH_9) { return 1 }
+    if (c == CH_UNDERSCORE)       { return 1 }
+    return 0
+}
+
+func pp_ltrim(buf: int, start: int, end: int) -> int {
+    i: int = start
+    while (i < end) {
+        c: int = __peekb(buf + i)
+        if (c != CH_SPACE and c != CH_TAB) { return i }
+        i += 1
+    }
+    return end
+}
+
+func pp_rtrim(buf: int, start: int, end: int) -> int {
+    i: int = end
+    while (i > start) {
+        c: int = __peekb(buf + i - 1)
+        if (c != CH_SPACE and c != CH_TAB) { return i }
+        i -= 1
+    }
+    return start
+}
+
+func pp_last_slash(s: int) -> int {
+    n: int = pp_strlen(s)
+    i: int = n - 1
+    while (i >= 0) {
+        if (__peekb(s + i) == 47) { return i }
+        i -= 1
+    }
+    return -1
+}
+
+func pp_path_join(dir: int, name: int) -> int {
+    dlen: int = pp_strlen(dir)
+    nlen: int = pp_strlen(name)
+    p: int = _flr_alloc(dlen + 1 + nlen + 1)
+    __memcpy(p, dir, dlen)
+    __pokeb(p + dlen, 47)
+    __memcpy(p + dlen + 1, name, nlen)
+    __pokeb(p + dlen + 1 + nlen, 0)
+    return p
+}
+
+func pp_dir_of(path: int) -> int {
+    sl: int = pp_last_slash(path)
+    if (sl < 0) { return pp_buf_to_str(".", 0, 1) }
+    return pp_buf_to_str(path, 0, sl)
+}
+
+func vec_to_str(v: Vec) -> int {
+    p: int = _flr_alloc(v.len + 1)
+    i: int = 0
+    while (i < v.len) { __pokeb(p + i, vec_get(v, i))
+    i += 1 }
+    __pokeb(p + v.len, 0)
+    return p
+}
+
+# ── define table ──────────────────────────────────────────────────────
+
+struct DefTab {
+    names: Vec
+    vals:  Vec
+}
+
+func deftab_new() -> DefTab {
+    dt: DefTab = _flr_alloc(8)
+    dt.names = vec_new(32)
+    dt.vals  = vec_new(32)
+    return dt
+}
+
+func deftab_find(dt: DefTab, name: int) -> int {
+    i: int = 0
+    while (i < dt.names.len) {
+        n: int = vec_get(dt.names, i)
+        if (pp_streq(n, name)) { return i }
+        i += 1
+    }
+    return -1
+}
+
+func deftab_set(dt: DefTab, name: int, val: int) -> void {
+    idx: int = deftab_find(dt, name)
+    if (idx >= 0) { vec_set(dt.vals, idx, val) }
+    else { vec_push(dt.names, name)
+    vec_push(dt.vals, val) }
+}
+
+func deftab_undef(dt: DefTab, name: int) -> void {
+    idx: int = deftab_find(dt, name)
+    if (idx < 0) { return }
+    last: int = dt.names.len - 1
+    vec_set(dt.names, idx, vec_get(dt.names, last))
+    vec_set(dt.vals,  idx, vec_get(dt.vals,  last))
+    dt.names.len -= 1
+    dt.vals.len  -= 1
+}
+
+# ── define substitution (with chaining) ──────────────────────────────
+# Expands a single word through the define table until stable.
+# Prevents infinite loops by limiting iterations.
+
+func deftab_expand(dt: DefTab, word: int) -> int {
+    cur: int = word
+    iters: int = 0
+    while (iters < 64) {
+        idx: int = deftab_find(dt, cur)
+        if (idx < 0) { return cur }
+        next: int = vec_get(dt.vals, idx)
+        # if value is the same word, stop (avoid infinite loop)
+        if (pp_streq(next, cur)) { return next }
+        cur = next
+        iters += 1
+    }
+    return cur
+}
+
+# Emit a line (buf[start..end]) with define substitution applied.
+# Skips substitution inside string literals and # comments.
+func subst_line(out: Vec, buf: int, start: int, end: int, dt: DefTab) -> void {
+    i: int = start
+    while (i < end) {
+        c: int = __peekb(buf + i)
+
+        # string literal — pass through verbatim
+        if (c == CH_QUOTE) {
+            pp_emit_ch(out, c)
+            i += 1
+            while (i < end and __peekb(buf + i) != CH_QUOTE) {
+                if (__peekb(buf + i) == CH_BACKSLASH and i + 1 < end) {
+                    pp_emit_ch(out, __peekb(buf + i))
+                    i += 1
+                }
+                pp_emit_ch(out, __peekb(buf + i))
+                i += 1
+            }
+            if (i < end) { pp_emit_ch(out, __peekb(buf + i))
+            i += 1 }
+
+        # comment — pass rest verbatim
+        } elif (c == CH_HASH) {
+            while (i < end) { pp_emit_ch(out, __peekb(buf + i))
+            i += 1 }
+
+        # word — try define expansion (chained)
+        } elif (pp_is_word(c) != 0) {
+            j: int = i
+            while (j < end and pp_is_word(__peekb(buf + j)) != 0) { j += 1 }
+            word: int = pp_buf_to_str(buf, i, j - i)
+            expanded: int = deftab_expand(dt, word)
+            pp_emit_str(out, expanded)
+            i = j
+
+        } else {
+            pp_emit_ch(out, c)
+            i += 1
+        }
+    }
+}
+
+# ── macro table ───────────────────────────────────────────────────────
+
+struct Macro {
+    name:    int
+    nparams: int
+    params:  Vec
+    body:    int   # raw body text (already has \n between lines)
+}
+
+struct MacroTab {
+    macros: Vec
+}
+
+func macrotab_new() -> MacroTab {
+    mt: MacroTab = _flr_alloc(4)
+    mt.macros = vec_new(16)
+    return mt
+}
+
+func macrotab_find(mt: MacroTab, name: int) -> Macro {
+    i: int = 0
+    while (i < mt.macros.len) {
+        m: Macro = vec_get(mt.macros, i)
+        if (pp_streq(m.name, name)) { return m }
+        i += 1
+    }
+    return 0
+}
+
+func macrotab_add(mt: MacroTab, m: Macro) -> void {
+    i: int = 0
+    while (i < mt.macros.len) {
+        existing: Macro = vec_get(mt.macros, i)
+        if (pp_streq(existing.name, m.name)) {
+            vec_set(mt.macros, i, m)
+            return
+        }
+        i += 1
+    }
+    vec_push(mt.macros, m)
+}
+
+# ── macro body expansion ──────────────────────────────────────────────
+# Substitutes \param references in body, then applies define expansion
+# to each resulting word so that defines inside macro bodies work.
+
+func expand_body(out: Vec, body: int, params: Vec, args: Vec, dt: DefTab) -> void {
+    # First pass: substitute \param → arg text into a temp buffer
+    tmp: Vec = vec_new(256)
+    blen: int = pp_strlen(body)
+    i: int = 0
+    while (i < blen) {
+        c: int = __peekb(body + i)
+        if (c == CH_BACKSLASH and i + 1 < blen) {
+            j: int = i + 1
+            while (j < blen and pp_is_word(__peekb(body + j)) != 0) { j += 1 }
+            if (j > i + 1) {
+                pname: int = pp_buf_to_str(body, i + 1, j - i - 1)
+                k: int = 0
+                found: int = 0
+                while (k < params.len) {
+                    pn: int = vec_get(params, k)
+                    if (pp_streq(pn, pname)) {
+                        arg: int = vec_get(args, k)
+                        pp_emit_str(tmp, arg)
+                        found = 1
+                        break
+                    }
+                    k += 1
+                }
+                if (found == 1) { i = j }
+                else { pp_emit_ch(tmp, c)
+                i += 1 }
+            } else {
+                pp_emit_ch(tmp, c)
+                i += 1
+            }
+        } else {
+            pp_emit_ch(tmp, c)
+            i += 1
+        }
+    }
+
+    # Second pass: run define substitution line-by-line over the temp buffer
+    tmp_str: int = vec_to_str(tmp)
+    tmp_len: int = tmp.len
+    p: int = 0
+    while (p < tmp_len) {
+        ls: int = p
+        while (p < tmp_len and __peekb(tmp_str + p) != CH_NL) { p += 1 }
+        le: int = p
+        if (p < tmp_len) { p += 1 }
+        subst_line(out, tmp_str, ls, le, dt)
+        pp_emit_ch(out, CH_NL)
+    }
+}
+
+# ── argument parser ───────────────────────────────────────────────────
+
+func parse_macro_args(buf: int, start: int, end: int) -> Vec {
+    args: Vec = vec_new(8)
+    i: int = start
+    depth: int = 0
+    seg_start: int = i
+    while (i <= end) {
+        c: int = -1
+        if (i < end) { c = __peekb(buf + i) }
+        if (c == CH_LPAREN) { depth += 1 }
+        elif (c == CH_RPAREN and depth > 0) { depth -= 1 }
+        if ((c == CH_COMMA and depth == 0) or i == end) {
+            ts: int = pp_ltrim(buf, seg_start, i)
+            te: int = pp_rtrim(buf, ts, i)
+            arg: int = pp_buf_to_str(buf, ts, te - ts)
+            vec_push(args, arg)
+            seg_start = i + 1
+        }
+        i += 1
+    }
+    return args
+}
+
+# ── main preprocessor ─────────────────────────────────────────────────
+
+func preproc_buf(out: Vec, src: int, srclen: int, filepath: int,
+                 dt: DefTab, mt: MacroTab) -> void {
+    pos: int = 0
+
+    while (pos < srclen) {
+        line_start: int = pos
+        while (pos < srclen and __peekb(src + pos) != CH_NL) { pos += 1 }
+        line_end: int = pos
+        if (pos < srclen) { pos += 1 }
+
+        ts: int = pp_ltrim(src, line_start, line_end)
+
+        if (ts < line_end and __peekb(src + ts) == CH_PERCENT) {
+            # read directive name
+            di: int = ts + 1
+            while (di < line_end and pp_is_word(__peekb(src + di)) != 0) { di += 1 }
+            directive: int = pp_buf_to_str(src, ts + 1, di - ts - 1)
+
+            if (pp_streq(directive, "define")) {
+                rest: int = pp_ltrim(src, di, line_end)
+                ni: int = rest
+                while (ni < line_end and pp_is_word(__peekb(src + ni)) != 0) { ni += 1 }
+                def_name: int = pp_buf_to_str(src, rest, ni - rest)
+                vs: int = pp_ltrim(src, ni, line_end)
+                ve: int = pp_rtrim(src, vs, line_end)
+                def_val: int = pp_buf_to_str(src, vs, ve - vs)
+                deftab_set(dt, def_name, def_val)
+                pp_emit_ch(out, CH_NL)
+
+            } elif (pp_streq(directive, "undef")) {
+                rest: int = pp_ltrim(src, di, line_end)
+                ni: int = rest
+                while (ni < line_end and pp_is_word(__peekb(src + ni)) != 0) { ni += 1 }
+                uname: int = pp_buf_to_str(src, rest, ni - rest)
+                deftab_undef(dt, uname)
+                pp_emit_ch(out, CH_NL)
+
+            } elif (pp_streq(directive, "include")) {
+                rest: int = pp_ltrim(src, di, line_end)
+                if (rest < line_end and __peekb(src + rest) == CH_QUOTE) {
+                    qi: int = rest + 1
+                    while (qi < line_end and __peekb(src + qi) != CH_QUOTE) { qi += 1 }
+                    incname: int = pp_buf_to_str(src, rest + 1, qi - rest - 1)
+                    # FIX: only join with dir if path is relative (doesn't start with '/')
+                    incpath: int = incname
+                    if (__peekb(incname) != 47) {
+                        dir: int = pp_dir_of(filepath)
+                        incpath = pp_path_join(dir, incname)
+                    }
+                    inc_len: [int] = [0]
+                    inc_buf: int = read_whole_file(incpath, inc_len)
+                    preproc_buf(out, inc_buf, inc_len[0], incpath, dt, mt)
+                    pp_emit_ch(out, CH_NL)
+                } else {
+                    print("fasm: %include missing filename")
+                    _flr_exit(1)
+                }
+
+            } elif (pp_streq(directive, "macro")) {
+                rest: int = pp_ltrim(src, di, line_end)
+                ni: int = rest
+                while (ni < line_end and pp_is_word(__peekb(src + ni)) != 0) { ni += 1 }
+                mac_name: int = pp_buf_to_str(src, rest, ni - rest)
+
+                params: Vec = vec_new(8)
+                pi: int = pp_ltrim(src, ni, line_end)
+                if (pi < line_end and __peekb(src + pi) == CH_LPAREN) {
+                    pi += 1
+                    while (pi < line_end and __peekb(src + pi) != CH_RPAREN) {
+                        ps: int = pp_ltrim(src, pi, line_end)
+                        pe: int = ps
+                        while (pe < line_end and pp_is_word(__peekb(src + pe)) != 0) { pe += 1 }
+                        if (pe > ps) {
+                            pname: int = pp_buf_to_str(src, ps, pe - ps)
+                            vec_push(params, pname)
+                        }
+                        pi = pe
+                        pi = pp_ltrim(src, pi, line_end)
+                        if (pi < line_end and __peekb(src + pi) == CH_COMMA) { pi += 1 }
+                    }
+                }
+
+                body_buf: Vec = vec_new(256)
+                while (pos < srclen) {
+                    bl_start: int = pos
+                    while (pos < srclen and __peekb(src + pos) != CH_NL) { pos += 1 }
+                    bl_end: int = pos
+                    if (pos < srclen) { pos += 1 }
+                    bts: int = pp_ltrim(src, bl_start, bl_end)
+                    if (bts < bl_end and __peekb(src + bts) == CH_PERCENT) {
+                        edi: int = bts + 1
+                        while (edi < bl_end and pp_is_word(__peekb(src + edi)) != 0) { edi += 1 }
+                        kw: int = pp_buf_to_str(src, bts + 1, edi - bts - 1)
+                        if (pp_streq(kw, "endmacro")) { break }
+                    }
+                    i: int = bl_start
+                    while (i < bl_end) { vec_push(body_buf, __peekb(src + i))
+                    i += 1 }
+                    vec_push(body_buf, CH_NL)
+                }
+
+                m: Macro = _flr_alloc(16)
+                m.name    = mac_name
+                m.nparams = params.len
+                m.params  = params
+                m.body    = vec_to_str(body_buf)
+                macrotab_add(mt, m)
+                pp_emit_ch(out, CH_NL)
+
+            } elif (pp_streq(directive, "endmacro")) {
+                pp_emit_ch(out, CH_NL)
+            } else {
+                print("fasm: unknown preprocessor directive")
+                _flr_exit(1)
+            }
+
+        } else {
+            # normal line — scan for macro invocations and define substitution
+            line_out: Vec = vec_new(128)
+            i: int = line_start
+
+            while (i < line_end) {
+                c: int = __peekb(src + i)
+
+                if (c == CH_QUOTE) {
+                    pp_emit_ch(line_out, c)
+                    i += 1
+                    while (i < line_end and __peekb(src + i) != CH_QUOTE) {
+                        if (__peekb(src + i) == CH_BACKSLASH and i + 1 < line_end) {
+                            pp_emit_ch(line_out, __peekb(src + i))
+                            i += 1
+                        }
+                        pp_emit_ch(line_out, __peekb(src + i))
+                        i += 1
+                    }
+                    if (i < line_end) { pp_emit_ch(line_out, __peekb(src + i))
+                    i += 1 }
+
+                } elif (c == CH_HASH) {
+                    while (i < line_end) { pp_emit_ch(line_out, __peekb(src + i))
+                    i += 1 }
+
+                } elif (pp_is_word(c) != 0) {
+                    j: int = i
+                    while (j < line_end and pp_is_word(__peekb(src + j)) != 0) { j += 1 }
+                    word: int = pp_buf_to_str(src, i, j - i)
+
+                    after: int = pp_ltrim(src, j, line_end)
+                    m: Macro = macrotab_find(mt, word)
+                    if (m != 0 and after < line_end and __peekb(src + after) == CH_LPAREN) {
+                        # macro invocation
+                        ap: int = after + 1
+                        depth: int = 1
+                        while (ap < line_end and depth > 0) {
+                            if (__peekb(src + ap) == CH_LPAREN)  { depth += 1 }
+                            elif (__peekb(src + ap) == CH_RPAREN) { depth -= 1 }
+                            if (depth > 0) { ap += 1 }
+                        }
+                        # FIX: zero-param macro — don't parse args if nparams==0
+                        args: Vec = vec_new(1)
+                        if (m.nparams > 0) {
+                            args = parse_macro_args(src, after + 1, ap)
+                        }
+                        if (args.len != m.nparams) {
+                            print("fasm: wrong argument count for macro")
+                            _flr_exit(1)
+                        }
+                        expand_body(line_out, m.body, m.params, args, dt)
+                        i = ap + 1
+                    } else {
+                        # define substitution (chained)
+                        expanded: int = deftab_expand(dt, word)
+                        pp_emit_str(line_out, expanded)
+                        i = j
+                    }
+
+                } else {
+                    pp_emit_ch(line_out, c)
+                    i += 1
+                }
+            }
+
+            k: int = 0
+            while (k < line_out.len) { vec_push(out, vec_get(line_out, k))
+            k += 1 }
+            pp_emit_ch(out, CH_NL)
+        }
+    }
+}
+
+# ── public entry point ────────────────────────────────────────────────
+
+func preprocess(src: int, srclen: int, filepath: str, out_len: [int]) -> int {
+    out: Vec    = vec_new(srclen + 64)
+    dt: DefTab  = deftab_new()
+    mt: MacroTab = macrotab_new()
+    preproc_buf(out, src, srclen, filepath, dt, mt)
+    result: int = vec_to_str(out)
+    out_len[0] = out.len
+    return result
+}

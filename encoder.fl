@@ -19,14 +19,16 @@ func modrm_reg(reg_field: int, rm_field: int) -> int {
 #   any other reg, disp=0 -> 1  (ModRM only)
 #   any other reg, disp!=0-> 5  (ModRM + disp32, always — no disp8
 #                                 optimization in v1)
-# %esp as a base is unsupported (needs a SIB byte) — dies clearly.
+# mem_size: byte count for the ModRM (+ SIB + disp) portion of a memory operand.
+# %esp as base requires a SIB byte (x86 encodes rm=4 as "has SIB" in ModRM).
 func mem_size(base: str, disp: int, label: str) -> int {
     if (_flr_str_len(label) > 0) { return 5 }
-    if (_flr_str_eq(base, "ebp") and disp == 0) { return 2 }
     if (_flr_str_eq(base, "esp")) {
-        print("fasm: %esp as a memory base needs a SIB byte, not supported yet")
-        _flr_exit(1)
+        # ModRM + SIB + disp
+        if (disp == 0) { return 2 }     # ModRM + SIB
+        return 6                         # ModRM + SIB + disp32
     }
+    if (_flr_str_eq(base, "ebp") and disp == 0) { return 2 }
     if (disp == 0) { return 1 }
     return 5
 }
@@ -36,6 +38,18 @@ func mem_encode(buf: Vec, reg_field: int, base: str, disp: int, label: str, syms
         emit8(buf, (reg_field << 3) | 5)
         addr: int = sym_lookup(syms, label, line)
         emit32(buf, addr)
+        return
+    }
+    # %esp base: ModRM rm=4 signals SIB; SIB=0x24 means [esp + no-index]
+    if (_flr_str_eq(base, "esp")) {
+        if (disp == 0) {
+            emit8(buf, (reg_field << 3) | 4)   # ModRM: mod=00 rm=4
+            emit8(buf, 0x24)                    # SIB: ss=0 index=4(none) base=4(esp)
+        } else {
+            emit8(buf, 0x80 | (reg_field << 3) | 4)  # ModRM: mod=10 rm=4
+            emit8(buf, 0x24)                           # SIB
+            emit32(buf, disp)
+        }
         return
     }
     if (_flr_str_eq(base, "ebp") and disp == 0) {
@@ -98,6 +112,9 @@ func instr_size(it: Item) -> int {
     } elif (_flr_str_eq(m, "add") or _flr_str_eq(m, "sub") or _flr_str_eq(m, "cmp")) {
         if (it.op1_kind == OP_REG and it.op2_kind == OP_REG) { return 2 }
         elif (it.op1_kind == OP_IMM and it.op2_kind == OP_REG) { return 6 }
+        elif (it.op1_kind == OP_MEM and it.op2_kind == OP_REG) {
+            return 1 + mem_size(it.op1_mem_base, it.op1_mem_disp, it.op1_mem_label)
+        }
         else {
             print("fasm: unsupported operand combination at line")
             print(it.line)
@@ -203,6 +220,13 @@ func encode_item(buf: Vec, it: Item, syms: Vec, addr: int) -> void {
             elif (_flr_str_eq(m, "cmp")) { opc = 0x39 }
             emit8(buf, opc)
             emit8(buf, modrm_reg(reg_num(it.op1_reg), reg_num(it.op2_reg)))
+        } elif (it.op1_kind == OP_MEM and it.op2_kind == OP_REG) {
+            # add/sub/cmp mem, reg  — opcodes: add=0x03 sub=0x2b cmp=0x3b
+            opc: int = 0x03
+            if (_flr_str_eq(m, "sub")) { opc = 0x2b }
+            elif (_flr_str_eq(m, "cmp")) { opc = 0x3b }
+            emit8(buf, opc)
+            mem_encode(buf, reg_num(it.op2_reg), it.op1_mem_base, it.op1_mem_disp, it.op1_mem_label, syms, it.line)
         } else {
             ext: int = 0
             if (_flr_str_eq(m, "sub")) { ext = 5 }

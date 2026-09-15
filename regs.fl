@@ -1,14 +1,14 @@
 import "std"
 
 func reg_num(name: str) -> int {
-    if (_flr_str_eq(name, "eax")) { return 0 }
-    elif (_flr_str_eq(name, "ecx")) { return 1 }
-    elif (_flr_str_eq(name, "edx")) { return 2 }
-    elif (_flr_str_eq(name, "ebx")) { return 3 }
-    elif (_flr_str_eq(name, "esp")) { return 4 }
-    elif (_flr_str_eq(name, "ebp")) { return 5 }
-    elif (_flr_str_eq(name, "esi")) { return 6 }
-    elif (_flr_str_eq(name, "edi")) { return 7 }
+    if (_flr_str_eq(name, "eax") or _flr_str_eq(name, "al") or _flr_str_eq(name, "ah")) { return 0 }
+    elif (_flr_str_eq(name, "ecx") or _flr_str_eq(name, "cl") or _flr_str_eq(name, "ch")) { return 1 }
+    elif (_flr_str_eq(name, "edx") or _flr_str_eq(name, "dl") or _flr_str_eq(name, "dh")) { return 2 }
+    elif (_flr_str_eq(name, "ebx") or _flr_str_eq(name, "bl") or _flr_str_eq(name, "bh")) { return 3 }
+    elif (_flr_str_eq(name, "esp") or _flr_str_eq(name, "sp")) { return 4 }
+    elif (_flr_str_eq(name, "ebp") or _flr_str_eq(name, "bp")) { return 5 }
+    elif (_flr_str_eq(name, "esi") or _flr_str_eq(name, "si")) { return 6 }
+    elif (_flr_str_eq(name, "edi") or _flr_str_eq(name, "di")) { return 7 }
     print("fasm: unknown register")
     print(name)
     _flr_exit(1)

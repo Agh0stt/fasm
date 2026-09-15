@@ -76,14 +76,21 @@ BSS directives:
     resd N    N x 4 bytes
     resq N    N x 8 bytes
 
-Registers: %eax %ecx %edx %ebx %esp %ebp %esi %edi
-%esp cannot be used as a memory base (no SIB support yet).
+Registers:
+
+    32-bit: %eax %ecx %edx %ebx %esp %ebp %esi %edi
+     8-bit: %al %ah %cl %ch %dl %dh %bl %bh
+
+8-bit names are accepted wherever a register is expected and map to their
+parent 32-bit register number. Instructions still operate on 32-bit values.
 
 Memory operands:
 
     (%eax)      [eax]
     4(%ebx)     [ebx + 4]
     -8(%ebp)    [ebp - 8]
+    (%esp)      [esp]  — SIB byte emitted automatically
+    -4(%esp)    [esp - 4]
     (label)     absolute address
 
 Immediates:
@@ -160,31 +167,36 @@ are absolute; anything else is resolved relative to the including file's directo
 ## Supported instructions
 
 Data movement:
+
     mov     reg->reg, imm->reg, label->reg, mem->reg, reg->mem, imm->mem
     lea     mem->reg
     push    reg, imm
     pop     reg
 
 Arithmetic:
-    add     reg+reg, imm+reg
-    sub     reg-reg, imm-reg
+
+    add     reg,reg / imm,reg / mem,reg
+    sub     reg,reg / imm,reg / mem,reg
+    cmp     reg,reg / imm,reg / mem,reg
     imul    EDX:EAX = EAX * src  (one-operand form)
     idiv    EAX = EDX:EAX / src, EDX = remainder  (one-operand form)
-    cdq     sign-extend EAX into EDX:EAX (required before idiv)
+    cdq     sign-extend EAX into EDX:EAX (use before idiv)
     inc     increment register
     dec     decrement register
     neg     two's complement negate
 
 Bitwise / shift:
-    and     reg&reg, imm&reg
-    or      reg|reg, imm|reg
-    xor     reg^reg
-    not     bitwise NOT
-    shl     $imm8, %reg  or  %cl, %reg
-    shr     $imm8, %reg  or  %cl, %reg
+
+    and     reg,reg / imm,reg
+    or      reg,reg / imm,reg
+    xor     reg,reg
+    not     reg
+    shl     $imm8,%reg  or  %cl,%reg
+    shr     $imm8,%reg  or  %cl,%reg
 
 Comparison / control flow:
-    cmp     set flags (reg-reg, imm-reg)
+
+    cmp     set flags
     jmp     unconditional jump to label
     call    call label (pushes return address)
     ret     return
@@ -192,6 +204,7 @@ Comparison / control flow:
     nop     no operation
 
 Conditional jumps:
+
     je/jz  jne/jnz  jl  jle  jg  jge  jb/jc  jbe  ja  jae/jnc
 
 All conditional jumps encode as 0F 8x rel32 (6 bytes, 32-bit displacement).
@@ -224,6 +237,30 @@ All conditional jumps encode as 0F 8x rel32 (6 bytes, 32-bit displacement).
 
 ---
 
+## cdecl calling convention
+
+Push arguments right-to-left, call, caller cleans the stack.
+Access args via positive offsets from %ebp, locals via negative offsets.
+
+    _start:
+        push $20        # arg2
+        push $10        # arg1
+        call add_two
+        add $8, %esp    # caller cleanup
+        mov %eax, %ebx
+        mov $1, %eax
+        int $0x80
+
+    add_two:
+        push %ebp
+        mov %esp, %ebp
+        mov 8(%ebp),  %eax   # arg1
+        add 12(%ebp), %eax   # arg2
+        pop %ebp
+        ret
+
+---
+
 ## Division
 
 idiv always operates on EDX:EAX. Use cdq first to sign-extend EAX into EDX.
@@ -237,15 +274,10 @@ idiv always operates on EDX:EAX. Use cdq first to sign-extend EAX into EDX.
 
 ## Two-pass assembly
 
-fasm does two passes over the instruction list:
+Pass 1 — walk all items, compute sizes, record every label address.
+Pass 2 — emit machine code; jmp/call/jcc compute rel32 = target - (here + size).
 
-  Pass 1 — walk all items, compute instruction sizes, record every label's
-            absolute address into the symbol table.
-  Pass 2 — emit real machine code; jmp/call/jcc compute
-            rel32 = target - (here + instr_size).
-
-Label sizes are fixed regardless of the resolved address, so pass 1 is
-always correct without iteration.
+Label sizes are fixed so pass 1 is always correct without iteration.
 
 ---
 
@@ -255,15 +287,15 @@ Minimal ELF32 executable with a single PT_LOAD segment:
 
     [ELF header 52 B][Program header 32 B][.text][.data]
 
-.bss is handled via memsz > filesz — no bytes in the file, zeroed by the
-kernel on load. Load address: 0x08048000 (standard i386 Linux base).
+.bss is handled via memsz > filesz — zeroed by the kernel on load.
+Load address: 0x08048000 (standard i386 Linux base).
 
 ---
 
 ## Limitations
 
-- %esp cannot be used as a memory base (no SIB byte)
-- imul/idiv one-operand form only
+- %esp as memory base requires no index (no scaled index addressing)
+- imul/idiv one-operand form only (two/three-operand forms not supported)
 - shl/shr shift count is $imm8 or %cl only
 - no indirect jumps (jmp *%eax)
 - single output file only (no object files / linking)
